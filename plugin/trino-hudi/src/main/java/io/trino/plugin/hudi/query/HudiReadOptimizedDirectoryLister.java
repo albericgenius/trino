@@ -22,6 +22,7 @@ import io.trino.plugin.hive.metastore.Table;
 import io.trino.plugin.hudi.HudiTableHandle;
 import io.trino.plugin.hudi.partition.HiveHudiPartitionInfo;
 import io.trino.plugin.hudi.partition.HudiPartitionInfo;
+import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.TableNotFoundException;
 import io.trino.spi.predicate.TupleDomain;
@@ -39,6 +40,7 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static io.trino.plugin.hudi.HudiUtil.buildInstantTime;
 import static io.trino.plugin.hudi.HudiUtil.getFileStatus;
 
 public class HudiReadOptimizedDirectoryLister
@@ -55,7 +57,10 @@ public class HudiReadOptimizedDirectoryLister
 
     private List<String> hivePartitionNames;
 
+    private Optional<List<String>> commitTimeRanges;
+
     public HudiReadOptimizedDirectoryLister(
+            ConnectorSession session,
             HoodieMetadataConfig metadataConfig,
             HoodieEngineContext engineContext,
             HudiTableHandle tableHandle,
@@ -69,9 +74,16 @@ public class HudiReadOptimizedDirectoryLister
         this.hiveMetastore = hiveMetastore;
         this.hiveTable = hiveTable;
         this.partitionColumnHandles = partitionColumnHandles;
-        this.fileSystemView = FileSystemViewManager.createInMemoryFileSystemView(engineContext, metaClient, metadataConfig);
+        this.fileSystemView = FileSystemViewManager.createInMemoryFileSystemViewWithTimeline(engineContext, metaClient, metadataConfig,
+                metaClient.getActiveTimeline().getWriteTimeline());
         this.partitionKeysFilter = MetastoreUtil.computePartitionKeyFilter(partitionColumnHandles, tableHandle.getPartitionPredicates());
         this.partitionColumns = hiveTable.getPartitionColumns();
+        if (tableHandle.getStartVersion().isPresent() || tableHandle.getEndVersion().isPresent()) {
+            commitTimeRanges = Optional.of(buildInstantTime(metaClient, tableHandle.getStartVersion(), tableHandle.getEndVersion()));
+        }
+        else {
+            commitTimeRanges = Optional.empty();
+        }
     }
 
     @Override
@@ -101,6 +113,13 @@ public class HudiReadOptimizedDirectoryLister
     @Override
     public List<FileStatus> listStatus(HudiPartitionInfo partitionInfo)
     {
+        if (commitTimeRanges.isPresent() && !commitTimeRanges.get().isEmpty()) {
+            //fileSystemView.getLatestBaseFilesInRange(this.commitTimeRanges) do not work at hudi 0.12.1
+            return fileSystemView.getLatestBaseFiles(partitionInfo.getRelativePartitionPath())
+                    .filter(baseFile -> commitTimeRanges.get().contains(baseFile.getCommitTime()))
+                    .map(baseFile -> getFileStatus(baseFile))
+                    .collect(toImmutableList());
+        }
         return fileSystemView.getLatestBaseFiles(partitionInfo.getRelativePartitionPath())
                 .map(baseFile -> getFileStatus(baseFile))
                 .collect(toImmutableList());

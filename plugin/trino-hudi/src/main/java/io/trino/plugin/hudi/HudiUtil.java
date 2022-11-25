@@ -22,32 +22,50 @@ import io.trino.plugin.hive.HivePartitionManager;
 import io.trino.plugin.hive.metastore.Column;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ColumnHandle;
+import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.NullableValue;
 import io.trino.spi.predicate.TupleDomain;
+import io.trino.spi.type.LongTimestampWithTimeZone;
+import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.Type;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.model.HoodieFileFormat;
+import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.hadoop.HoodieParquetInputFormat;
 import org.apache.hudi.hadoop.utils.HoodieInputFormatUtils;
 
 import java.io.IOException;
+import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static io.trino.plugin.hive.HiveErrorCode.HIVE_INVALID_METADATA;
 import static io.trino.plugin.hive.util.HiveUtil.checkCondition;
 import static io.trino.plugin.hive.util.HiveUtil.parsePartitionValue;
 import static io.trino.plugin.hudi.HudiErrorCode.HUDI_CANNOT_OPEN_SPLIT;
 import static io.trino.plugin.hudi.HudiErrorCode.HUDI_UNSUPPORTED_FILE_FORMAT;
+import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
+import static io.trino.spi.type.BigintType.BIGINT;
+import static io.trino.spi.type.DateTimeEncoding.unpackMillisUtc;
 import static java.util.stream.Collectors.toList;
+import static org.apache.hudi.common.table.timeline.HoodieTimeline.EQUALS;
+import static org.apache.hudi.common.table.timeline.HoodieTimeline.GREATER_THAN;
+import static org.apache.hudi.common.table.timeline.HoodieTimeline.LESSER_THAN_OR_EQUALS;
 
 public final class HudiUtil
 {
+    public static final String INSTANT_TIME = "_hoodie_commit_time";
+    public static final String DEFAULT_INSTANT_TIME_FORMAT = "yyyyMMddHHmmssSSS";
+
     private HudiUtil() {}
 
     public static boolean isHudiParquetInputFormat(InputFormat<?, ?> inputFormat)
@@ -159,6 +177,88 @@ public final class HudiUtil
         }
         catch (IOException e) {
             throw new TrinoException(HUDI_CANNOT_OPEN_SPLIT, "Error getting file status of " + baseFile.getPath(), e);
+        }
+    }
+
+    public static HoodieTableMetaClient buildTableMetaClient(Configuration configuration, String basePath)
+    {
+        HoodieTableMetaClient client = HoodieTableMetaClient.builder().setConf(configuration).setBasePath(basePath).build();
+        client.getTableConfig().setValue("hoodie.bootstrap.index.enable", "false");
+        return client;
+    }
+
+    public static Optional<String> getHoodieInstantTime(Optional<ConnectorTableVersion> optionalVersion)
+    {
+        if (optionalVersion.isPresent()) {
+            ConnectorTableVersion version = optionalVersion.get();
+            SimpleDateFormat formatter = new SimpleDateFormat(DEFAULT_INSTANT_TIME_FORMAT);
+            io.trino.spi.type.Type versionType = version.getVersionType();
+            switch (version.getPointerType()) {
+                case TEMPORAL:
+                    long epochMillis;
+                    if (versionType instanceof TimestampWithTimeZoneType) {
+                        epochMillis = ((TimestampWithTimeZoneType) versionType).isShort()
+                                ? unpackMillisUtc((long) version.getVersion())
+                                : ((LongTimestampWithTimeZone) version.getVersion()).getEpochMillis();
+                    }
+                    else {
+                        throw new TrinoException(NOT_SUPPORTED, "Unsupported type for temporal table version: " + versionType.getDisplayName());
+                    }
+                    return Optional.of(formatter.format(new Timestamp(epochMillis)));
+
+                case TARGET_ID:
+                    if (versionType != BIGINT) {
+                        throw new TrinoException(NOT_SUPPORTED, "Unsupported type for table version: " + versionType.getDisplayName());
+                    }
+                    String instantTime = String.valueOf(version.getVersion());
+
+                    return Optional.of(instantTime);
+            }
+            throw new TrinoException(NOT_SUPPORTED, "Version pointer type is not supported: " + version.getPointerType());
+        }
+        else {
+            return Optional.empty();
+        }
+    }
+
+    public static List<String> buildInstantTime(
+            HoodieTableMetaClient metaClient,
+            Optional<String> startVersion,
+            Optional<String> endVersion)
+    {
+        ImmutableList.Builder<String> commitTimeRangeBuilder = ImmutableList.builder();
+        metaClient.getCommitsTimeline().getInstants()
+                .filter(instant -> filterInstantTime(instant.getTimestamp(), startVersion, endVersion))
+                .forEach(instant -> commitTimeRangeBuilder.add(instant.getTimestamp()));
+        return commitTimeRangeBuilder.build();
+    }
+
+    public static boolean filterInstantTime(
+            String timestamp,
+            Optional<String> startVersion,
+            Optional<String> endVersion)
+    {
+        if (endVersion.isPresent() && startVersion.isPresent() && startVersion.get().equals(endVersion.get())) {
+            return HoodieTimeline.compareTimestamps(
+                    timestamp,
+                    EQUALS,
+                    endVersion.get());
+        }
+        else {
+            boolean predicate = true;
+            if (startVersion.isPresent()) {
+                predicate = HoodieTimeline.compareTimestamps(
+                        timestamp,
+                        GREATER_THAN,
+                        startVersion.get());
+            }
+            if (endVersion.isPresent()) {
+                predicate = predicate && HoodieTimeline.compareTimestamps(
+                        timestamp,
+                        LESSER_THAN_OR_EQUALS,
+                        endVersion.get());
+            }
+            return predicate;
         }
     }
 }

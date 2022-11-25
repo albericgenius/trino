@@ -28,6 +28,7 @@ import java.util.List;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.plugin.base.session.PropertyMetadataUtil.dataSizeProperty;
+import static io.trino.plugin.hudi.HudiUtil.INSTANT_TIME;
 import static io.trino.spi.StandardErrorCode.INVALID_SESSION_PROPERTY;
 import static io.trino.spi.session.PropertyMetadata.booleanProperty;
 import static io.trino.spi.session.PropertyMetadata.doubleProperty;
@@ -35,6 +36,7 @@ import static io.trino.spi.session.PropertyMetadata.integerProperty;
 import static io.trino.spi.type.VarcharType.VARCHAR;
 import static java.lang.String.format;
 import static java.util.Locale.ENGLISH;
+import static java.util.stream.Collectors.toUnmodifiableList;
 
 public class HudiSessionProperties
         implements SessionPropertiesProvider
@@ -116,7 +118,7 @@ public class HudiSessionProperties
     @SuppressWarnings("unchecked")
     public static List<String> getColumnsToHide(ConnectorSession session)
     {
-        return (List<String>) session.getProperty(COLUMNS_TO_HIDE, List.class);
+        return (List<String>) session.getProperty(COLUMNS_TO_HIDE, List.class).stream().filter(column -> !INSTANT_TIME.equals(column)).collect(toUnmodifiableList());
     }
 
     public static boolean isHudiMetadataEnabled(ConnectorSession session)

@@ -16,6 +16,7 @@ package io.trino.plugin.hudi;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.airlift.log.Logger;
+import io.airlift.slice.Slices;
 import io.trino.hdfs.HdfsContext;
 import io.trino.hdfs.HdfsEnvironment;
 import io.trino.plugin.hive.HiveColumnHandle;
@@ -29,12 +30,14 @@ import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTableMetadata;
+import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.SchemaTablePrefix;
 import io.trino.spi.connector.TableColumnsMetadata;
 import io.trino.spi.connector.TableNotFoundException;
+import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.TypeManager;
 import org.apache.hadoop.conf.Configuration;
@@ -60,7 +63,15 @@ import static io.trino.plugin.hudi.HudiErrorCode.HUDI_UNKNOWN_TABLE_TYPE;
 import static io.trino.plugin.hudi.HudiSessionProperties.getColumnsToHide;
 import static io.trino.plugin.hudi.HudiTableProperties.LOCATION_PROPERTY;
 import static io.trino.plugin.hudi.HudiTableProperties.PARTITIONED_BY_PROPERTY;
+import static io.trino.plugin.hudi.HudiUtil.INSTANT_TIME;
+import static io.trino.plugin.hudi.HudiUtil.getHoodieInstantTime;
+import static io.trino.spi.connector.PointerType.TARGET_ID;
 import static io.trino.spi.connector.SchemaTableName.schemaTableName;
+import static io.trino.spi.predicate.Range.equal;
+import static io.trino.spi.predicate.Range.greaterThanOrEqual;
+import static io.trino.spi.predicate.Range.lessThanOrEqual;
+import static io.trino.spi.predicate.Range.range;
+import static io.trino.spi.predicate.ValueSet.ofRanges;
 import static java.lang.String.format;
 import static java.util.Collections.singletonList;
 import static java.util.Objects.requireNonNull;
@@ -97,6 +108,16 @@ public class HudiMetadata
     @Override
     public HudiTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName)
     {
+        return getTableHandle(session, tableName, Optional.empty(), Optional.empty());
+    }
+
+    @Override
+    public HudiTableHandle getTableHandle(
+            ConnectorSession session,
+            SchemaTableName tableName,
+            Optional<ConnectorTableVersion> startVersion,
+            Optional<ConnectorTableVersion> endVersion)
+    {
         if (isHiveSystemSchema(tableName.getSchemaName())) {
             return null;
         }
@@ -107,11 +128,21 @@ public class HudiMetadata
         if (!isHudiTable(session, table.get())) {
             throw new TrinoException(HUDI_UNKNOWN_TABLE_TYPE, format("Not a Hudi table: %s", tableName));
         }
+        if (endVersion.isPresent() && endVersion.get().getPointerType() == TARGET_ID) {
+            startVersion = endVersion;
+        }
+        List<HiveColumnHandle> dataColumns = hiveColumnHandles(table.get(), typeManager, NANOSECONDS).stream()
+                .collect(toImmutableList());
+
         return new HudiTableHandle(
                 tableName.getSchemaName(),
                 tableName.getTableName(),
                 table.get().getStorage().getLocation(),
                 HoodieTableType.COPY_ON_WRITE,
+                ImmutableList.of(),
+                dataColumns,
+                getHoodieInstantTime(startVersion),
+                getHoodieInstantTime(endVersion),
                 TupleDomain.all(),
                 TupleDomain.all());
     }
@@ -128,9 +159,16 @@ public class HudiMetadata
     {
         HudiTableHandle handle = (HudiTableHandle) tableHandle;
         HudiPredicates predicates = HudiPredicates.from(constraint.getSummary());
+        TupleDomain<HiveColumnHandle> columnPredicates = predicates.getRegularColumnPredicates();
+        if (handle.getStartVersion().isPresent() || handle.getEndVersion().isPresent()) {
+            Optional<TupleDomain> instantTimeDomainOptional = buildInstantTimeDomain(handle.getDataColumns(), handle.getStartVersion(), handle.getEndVersion());
+            if (instantTimeDomainOptional.isPresent()) {
+                columnPredicates = columnPredicates.intersect(instantTimeDomainOptional.get());
+            }
+        }
         HudiTableHandle newHudiTableHandle = handle.applyPredicates(
                 predicates.getPartitionColumnPredicates(),
-                predicates.getRegularColumnPredicates());
+                columnPredicates);
 
         if (handle.getPartitionPredicates().equals(newHudiTableHandle.getPartitionPredicates())
                 && handle.getRegularPredicates().equals(newHudiTableHandle.getRegularPredicates())) {
@@ -141,6 +179,43 @@ public class HudiMetadata
                 newHudiTableHandle,
                 newHudiTableHandle.getRegularPredicates().transformKeys(ColumnHandle.class::cast),
                 false));
+    }
+
+    private Optional<TupleDomain> buildInstantTimeDomain(List<HiveColumnHandle> dataColumns, Optional<String> startVersion, Optional<String> endVersion)
+    {
+        if (startVersion.isPresent() || endVersion.isPresent()) {
+            Optional<HiveColumnHandle> columnHandle = dataColumns.stream()
+                    .filter(column -> column.getName().equals(INSTANT_TIME))
+                    .findFirst();
+            Optional<ColumnMetadata> column = columnHandle.map(HiveColumnHandle.class::cast).map(HiveColumnHandle::getColumnMetadata);
+
+            if (columnHandle.isPresent() && column.isPresent()) {
+                Domain newDomain;
+                if (startVersion.isPresent() && endVersion.isPresent()) {
+                    if (startVersion.get().equals(endVersion.get())) {
+                        newDomain = Domain.create(
+                                ofRanges(equal(column.get().getType(), Slices.utf8Slice(endVersion.get()))), false);
+                    }
+                    else {
+                        newDomain = Domain.create(
+                                ofRanges(range(column.get().getType(), Slices.utf8Slice(startVersion.get()), true, Slices.utf8Slice(endVersion.get()), true)),
+                                false);
+                    }
+                }
+                else if (startVersion.isPresent()) {
+                    newDomain = Domain.create(
+                            ofRanges(greaterThanOrEqual(column.get().getType(), Slices.utf8Slice(startVersion.get()))), false);
+                }
+                else if (endVersion.isPresent()) {
+                    newDomain = Domain.create(ofRanges(lessThanOrEqual(column.get().getType(), Slices.utf8Slice(endVersion.get()))), false);
+                }
+                else {
+                    newDomain = Domain.all(column.get().getType());
+                }
+                return Optional.of(TupleDomain.withColumnDomains(ImmutableMap.of(columnHandle.get(), newDomain)));
+            }
+        }
+        return Optional.empty();
     }
 
     @Override

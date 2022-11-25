@@ -61,6 +61,7 @@ import io.trino.sql.planner.iterative.rule.EvaluateZeroSample;
 import io.trino.sql.planner.iterative.rule.ExtractDereferencesFromFilterAboveScan;
 import io.trino.sql.planner.iterative.rule.ExtractSpatialJoins;
 import io.trino.sql.planner.iterative.rule.GatherAndMergeWindows;
+import io.trino.sql.planner.iterative.rule.HudiPushTableVersionIntoTableScan;
 import io.trino.sql.planner.iterative.rule.ImplementBernoulliSampleAsFilter;
 import io.trino.sql.planner.iterative.rule.ImplementExceptAll;
 import io.trino.sql.planner.iterative.rule.ImplementExceptDistinctAsUnion;
@@ -915,6 +916,7 @@ public class PlanOptimizers
                 ImmutableSet.<Rule<?>>builder()
                         .addAll(simplifyOptimizerRules) // Should be always run after PredicatePushDown
                         .add(new PushPredicateIntoTableScan(plannerContext, typeAnalyzer))
+                        .add(new HudiPushTableVersionIntoTableScan(plannerContext))
                         .add(new RemoveRedundantPredicateAboveTableScan(plannerContext, typeAnalyzer))
                         .build()));
         builder.add(inlineProjections);

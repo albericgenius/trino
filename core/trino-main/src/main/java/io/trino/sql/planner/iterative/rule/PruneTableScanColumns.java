@@ -39,6 +39,8 @@ import java.util.function.Function;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static io.trino.sql.planner.iterative.rule.HudiPushTableVersionIntoTableScan.HOODIE_CATALOG_NAME;
+import static io.trino.sql.planner.iterative.rule.HudiPushTableVersionIntoTableScan.HOODIE_COMMIT_TIME;
 import static io.trino.sql.planner.plan.Patterns.tableScan;
 import static io.trino.util.MoreLists.filteredCopy;
 import static java.util.Objects.requireNonNull;
@@ -62,6 +64,11 @@ public class PruneTableScanColumns
     {
         Session session = context.getSession();
         TypeProvider types = context.getSymbolAllocator().getTypes();
+        if (node.getTable().getCatalogHandle().getId().equals(HOODIE_CATALOG_NAME)) {
+            ImmutableSet.Builder<Symbol> outputBuilder = ImmutableSet.builder();
+            outputBuilder.addAll(referencedOutputs).add(new Symbol(HOODIE_COMMIT_TIME));
+            referencedOutputs = outputBuilder.build();
+        }
 
         return pruneColumns(metadata, types, session, node, referencedOutputs);
     }
